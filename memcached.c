@@ -54,6 +54,10 @@
 #endif
 #endif
 
+/* constants for mmcmod */
+#define MMCMODFILE "mmcmod.db"
+#define DEFAULTBUCKETNUM 150000
+
 /*
  * forward declarations
  */
@@ -110,6 +114,9 @@ time_t process_started;     /* when the process was started */
 /** file scope variables **/
 static conn *listen_conn = NULL;
 static struct event_base *main_base;
+
+/** mmcmod variables */
+static MMCSTORAGE *storage;
 
 enum transmit_result {
     TRANSMIT_COMPLETE,   /** All done writing. */
@@ -195,6 +202,8 @@ static void settings_init(void) {
     settings.backlog = 1024;
     settings.binding_protocol = negotiating_prot;
     settings.item_size_max = 1024 * 1024; /* The famous 1MB upper limit. */
+    settings.enginesopath = NULL;         /* for mmcmod */
+    settings.dbfile = MMCMODFILE;         /* for mmcmod */
 }
 
 /*
@@ -856,7 +865,11 @@ static void complete_nread_ascii(conn *c) {
 
     }
 
-    item_remove(c->item);       /* release the c->item reference */
+    if (settings.enginesopath)
+        mmcstorage_free(storage, it, ITEM_ntotal(it));
+    else
+        item_remove(c->item);       /* release the c->item reference */
+    
     c->item = 0;
 }
 
@@ -1987,7 +2000,12 @@ static void process_bin_flush(conn *c) {
     } else {
         settings.oldest_live = current_time - 1;
     }
-    item_flush_expired();
+    
+    if (settings.enginesopath) {
+        if(mmcstorage_flush(storage, NULL))
+            out_string(c, "SERVER_ERROR couldn't flush the database");
+    } else
+        item_flush_expired();
 
     pthread_mutex_lock(&c->thread->stats.mutex);
     c->thread->stats.flush_cmds++;
@@ -2108,15 +2126,21 @@ static void complete_nread(conn *c) {
  */
 enum store_item_type do_store_item(item *it, int comm, conn *c) {
     char *key = ITEM_key(it);
-    item *old_it = do_item_get(key, it->nkey);
+    item *old_it = NULL;
     enum store_item_type stored = NOT_STORED;
 
     item *new_it = NULL;
     int flags;
 
+    if (settings.enginesopath)
+        old_it = mmcmod_item_get(storage, key, it->nkey);
+    else
+        old_it = do_item_get(key, it->nkey);
+
     if (old_it != NULL && comm == NREAD_ADD) {
         /* add only adds a nonexistent item, but promote to head of LRU */
-        do_item_update(old_it);
+        if(!settings.enginesopath)
+            do_item_update(old_it);
     } else if (!old_it && (comm == NREAD_REPLACE
         || comm == NREAD_APPEND || comm == NREAD_PREPEND))
     {
@@ -2200,21 +2224,31 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
         }
 
         if (stored == NOT_STORED) {
-            if (old_it != NULL)
-                item_replace(old_it, it);
-            else
-                do_item_link(it);
-
+            /* mmcmod modification */
+            if (settings.enginesopath) {
+                if(!mmcstorage_put(storage, ITEM_key(it), strlen(ITEM_key(it)), 
+                                  it, (ITEM_ntotal(it))))
+                    stored = STORED;
+            } else {
+                if (old_it != NULL)
+                    item_replace(old_it, it);
+                else
+                    do_item_link(it);
+                stored = STORED;
+            }
             c->cas = ITEM_get_cas(it);
-
-            stored = STORED;
         }
     }
-
-    if (old_it != NULL)
-        do_item_remove(old_it);         /* release our reference */
-    if (new_it != NULL)
-        do_item_remove(new_it);
+    
+    if (settings.enginesopath) {
+        if(old_it != NULL)
+            mmcstorage_free(storage, old_it, ITEM_ntotal(old_it));
+    } else {
+        if (old_it != NULL)
+            do_item_remove(old_it);   /* release our reference */
+        if (new_it != NULL)
+            do_item_remove(new_it);
+    }
 
     if (stored == STORED) {
         c->cas = ITEM_get_cas(it);
@@ -2533,6 +2567,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
     item *it;
     token_t *key_token = &tokens[KEY_TOKEN];
     char *suffix;
+    int vsiz = 0;
     assert(c != NULL);
 
     do {
@@ -2546,7 +2581,13 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 return;
             }
 
-            it = item_get(key, nkey);
+            /* mmcmod modification */
+            if(settings.enginesopath) {
+                it = mmcstorage_get(storage, key, nkey, &vsiz); 
+            } else {
+                it = item_get(key, nkey);
+            }
+
             if (settings.detail_enabled) {
                 stats_prefix_record_get(key, nkey, NULL != it);
             }
@@ -2557,7 +2598,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         c->isize *= 2;
                         c->ilist = new_list;
                     } else {
-                        item_remove(it);
+                        if(settings.enginesopath) {
+                            assert(ITEM_ntotal(it) == vsiz);
+                            mmcstorage_free(storage, it, vsiz);
+                        }else
+                            item_remove(it);
                         break;
                     }
                 }
@@ -2582,7 +2627,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         c->suffixsize *= 2;
                         c->suffixlist  = new_suffix_list;
                     } else {
-                        item_remove(it);
+                        if(settings.enginesopath) {
+                            assert(ITEM_ntotal(it) == vsiz);
+                            mmcstorage_free(storage, it, vsiz);
+                        }else
+                            item_remove(it);
                         break;
                     }
                   }
@@ -2590,7 +2639,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                   suffix = cache_alloc(c->thread->suffix_cache);
                   if (suffix == NULL) {
                     out_string(c, "SERVER_ERROR out of memory making CAS suffix");
-                    item_remove(it);
+                    if(settings.enginesopath) {
+                        assert(ITEM_ntotal(it) == vsiz);
+                        mmcstorage_free(storage, it, vsiz);
+                    }else
+                        item_remove(it);
                     return;
                   }
                   *(c->suffixlist + i) = suffix;
@@ -2603,7 +2656,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       add_iov(c, suffix, suffix_len) != 0 ||
                       add_iov(c, ITEM_data(it), it->nbytes) != 0)
                       {
-                          item_remove(it);
+                          if(settings.enginesopath) {
+                              assert(ITEM_ntotal(it) == vsiz);
+                              mmcstorage_free(storage, it, vsiz);
+                          }else
+                              item_remove(it);
                           break;
                       }
                 }
@@ -2615,7 +2672,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       add_iov(c, ITEM_key(it), it->nkey) != 0 ||
                       add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
                       {
-                          item_remove(it);
+                          if(settings.enginesopath) {
+                              assert(ITEM_ntotal(it) == vsiz);
+                              mmcstorage_free(storage, it, vsiz);
+                          }else
+                              item_remove(it);
                           break;
                       }
                 }
@@ -2629,7 +2690,8 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 c->thread->stats.slab_stats[it->slabs_clsid].get_hits++;
                 c->thread->stats.get_cmds++;
                 pthread_mutex_unlock(&c->thread->stats.mutex);
-                item_update(it);
+                if (!settings.enginesopath)
+                    item_update(it);
                 *(c->ilist + i) = it;
                 i++;
 
@@ -2732,7 +2794,10 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         stats_prefix_record_set(key, nkey);
     }
 
-    it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
+    if (!settings.enginesopath)
+        it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
+    else
+        it = mmcmod_item_alloc(storage, key, nkey, flags, realtime(exptime), vlen);
 
     if (it == 0) {
         if (! item_size_ok(nkey, flags, vlen))
@@ -2770,6 +2835,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
     uint64_t delta;
     char *key;
     size_t nkey;
+    int vsiz;
 
     assert(c != NULL);
 
@@ -2788,7 +2854,11 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
         return;
     }
 
-    it = item_get(key, nkey);
+    if (settings.enginesopath)
+        it = mmcstorage_get(storage, key, nkey, &vsiz);
+    else
+        it = item_get(key, nkey);
+
     if (!it) {
         pthread_mutex_lock(&c->thread->stats.mutex);
         if (incr) {
@@ -2813,7 +2883,12 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
         out_string(c, "SERVER_ERROR out of memory");
         break;
     }
-    item_remove(it);         /* release our reference */
+
+    if (settings.enginesopath) {
+        assert(ITEM_ntotal(it) == vsiz);
+        mmcstorage_free(storage, it, vsiz);
+    }else
+        item_remove(it);         /* release our reference */
 }
 
 /*
@@ -2863,14 +2938,27 @@ enum delta_result_type do_add_delta(conn *c, item *it, const bool incr,
     res = strlen(buf);
     if (res + 2 > it->nbytes) { /* need to realloc */
         item *new_it;
-        new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2 );
+
+        if (settings.enginesopath)
+            new_it = mmcmod_item_alloc(storage, ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2);
+        else
+            new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2 );
+
         if (new_it == 0) {
             return EOM;
         }
         memcpy(ITEM_data(new_it), buf, res);
         memcpy(ITEM_data(new_it) + res, "\r\n", 2);
-        item_replace(it, new_it);
-        do_item_remove(new_it);       /* release our reference */
+
+        if (settings.enginesopath) {
+            /* replace item */
+            mmcstorage_put(storage, ITEM_key(it), strlen(ITEM_key(it)), 
+                           new_it, (ITEM_ntotal(new_it)));
+            free(new_it); 
+        } else {
+            item_replace(it, new_it);
+            do_item_remove(new_it);       /* release our reference */
+        }
     } else { /* replace in-place */
         /* When changing the value without replacing the item, we
            need to update the CAS on the existing item. */
@@ -2878,6 +2966,11 @@ enum delta_result_type do_add_delta(conn *c, item *it, const bool incr,
 
         memcpy(ITEM_data(it), buf, res);
         memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
+
+        if (settings.enginesopath) {
+            mmcstorage_put(storage, ITEM_key(it), strlen(ITEM_key(it)), 
+                           it, (ITEM_ntotal(it)));
+        }
     }
 
     return OK;
@@ -2887,6 +2980,7 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
     char *key;
     size_t nkey;
     item *it;
+    int vsiz;
 
     assert(c != NULL);
 
@@ -2915,7 +3009,11 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         stats_prefix_record_delete(key, nkey);
     }
 
-    it = item_get(key, nkey);
+    if (settings.enginesopath)
+        it = mmcstorage_get(storage, key, nkey, &vsiz);
+    else
+        it = item_get(key, nkey);
+
     if (it) {
         MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
 
@@ -2923,8 +3021,14 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         c->thread->stats.slab_stats[it->slabs_clsid].delete_hits++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        item_unlink(it);
-        item_remove(it);      /* release our reference */
+        if (settings.enginesopath) {
+            mmcstorage_del(storage, key, nkey);
+            assert(ITEM_ntotal(it) == vsiz);
+            mmcstorage_free(storage, it, vsiz);
+        } else {
+            item_unlink(it);
+            item_remove(it);      /* release our reference */
+        }
         out_string(c, "DELETED");
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -3026,7 +3130,13 @@ static void process_command(conn *c, char *command) {
 
         if(ntokens == (c->noreply ? 3 : 2)) {
             settings.oldest_live = current_time - 1;
-            item_flush_expired();
+            
+            if (settings.enginesopath) {
+                if(mmcstorage_flush(storage, NULL)) 
+                    out_string(c, "SERVER_ERROR couldn't flush the database");
+            } else
+                item_flush_expired();
+
             out_string(c, "OK");
             return;
         }
@@ -3047,7 +3157,12 @@ static void process_command(conn *c, char *command) {
             settings.oldest_live = realtime(exptime) - 1;
         else /* exptime == 0 */
             settings.oldest_live = current_time - 1;
-        item_flush_expired();
+
+        if (settings.enginesopath) {
+            if(mmcstorage_flush(storage, NULL))
+                out_string(c, "SERVER_ERROR couldn't flush the database");
+        } else 
+            item_flush_expired();
         out_string(c, "OK");
         return;
 
@@ -3188,7 +3303,7 @@ static int try_read_command(conn *c) {
         *el = '\0';
 
         assert(cont <= (c->rcurr + c->rbytes));
-
+ 
         process_command(c, c->rcurr);
 
         c->rbytes -= (cont - c->rcurr);
@@ -3664,7 +3779,12 @@ static void drive_machine(conn *c) {
                     while (c->ileft > 0) {
                         item *it = *(c->icurr);
                         assert((it->it_flags & ITEM_SLABBED) == 0);
-                        item_remove(it);
+
+                        if (settings.enginesopath)
+                            mmcstorage_free(storage, it, ITEM_ntotal(it));
+                        else
+                            item_remove(it);
+
                         c->icurr++;
                         c->ileft--;
                     }
@@ -4100,7 +4220,8 @@ static void usage(void) {
            "-i            print memcached and libevent license\n"
            "-P <file>     save PID in <file>, only used with -d option\n"
            "-f <factor>   chunk size growth factor (default: 1.25)\n"
-           "-n <bytes>    minimum space allocated for key+value+flags (default: 48)\n");
+           "-n <bytes>    minimum space allocated for key+value+flags (default: 48)\n"
+           "-e <path>     path to the external storage module\n");
     printf("-L            Try to use large memory pages (if available). Increasing\n"
            "              the memory page size could reduce the number of TLB misses\n"
            "              and improve the performance. In order to get large pages\n"
@@ -4234,6 +4355,11 @@ static void remove_pidfile(const char *pid_file) {
 }
 
 static void sig_handler(const int sig) {
+    if (settings.enginesopath) {
+        mmcstorage_close(storage);
+        mmcstorage_destruct(storage);
+    }
+
     printf("SIGINT handled.\n");
     exit(EXIT_SUCCESS);
 }
@@ -4377,6 +4503,8 @@ int main (int argc, char **argv) {
           "B:"  /* Binding protocol */
           "I:"  /* Max item size */
           "S"   /* Sasl ON */
+          "e:"  /* enginesopath */
+          "o:"  /* dbfile */
         ))) {
         switch (c) {
         case 'a':
@@ -4539,6 +4667,12 @@ int main (int argc, char **argv) {
 #endif
             settings.sasl = true;
             break;
+        case 'e':
+            settings.enginesopath = optarg;
+            break;
+        case 'o':
+            settings.dbfile = optarg;
+            break;
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
             return 1;
@@ -4661,7 +4795,23 @@ int main (int argc, char **argv) {
     stats_init();
     assoc_init();
     conn_init();
-    slabs_init(settings.maxbytes, settings.factor, preallocate);
+
+    /* Initialize mmcstorage */
+    if (settings.enginesopath) {
+        if((storage = mmcstorage_new()) == NULL) {
+            fprintf(stderr, "failed to startup the storage engine\n");
+            exit(EXIT_FAILURE);
+        }
+
+        if(mmcstorage_open(storage, settings.dbfile) < 0) {
+            mmcstorage_destruct(storage);
+            fprintf(stderr, "failed to open database\n");
+            exit(EXIT_FAILURE);
+        }
+        mmcstorage_conf(storage, DEFAULTBUCKETNUM, NULL);
+    } else {
+        slabs_init(settings.maxbytes, settings.factor, preallocate);
+    }
 
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we

@@ -1,3 +1,5 @@
+#include <string.h>
+
 /* See items.c */
 uint64_t get_cas_id(void);
 
@@ -21,5 +23,20 @@ void do_item_flush_expired(void);
 
 item *do_item_get(const char *key, const size_t nkey);
 item *do_item_get_nocheck(const char *key, const size_t nkey);
+
+item *mmcmod_item_get(void *mmcstorage, const char *key, const int nkey);
+
+item *mmcmod_item_alloc(void *mmcstorage, char *key, const size_t nkey, const int flags, const rel_time_t exptime, const int nbytes);
 void item_stats_reset(void);
 extern pthread_mutex_t cache_lock;
+static inline ssize_t item_data_read(item *it, void *buf, size_t count, off_t offset)
+{
+	memcpy(buf, ITEM_data(it) + offset, count);
+	return count;
+}
+
+static inline ssize_t item_data_write(item *it, const void *buf, size_t count, off_t offset)
+{
+	memcpy(ITEM_data(it) + offset, buf, count);
+	return count;
+}

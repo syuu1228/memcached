@@ -82,6 +82,34 @@ static size_t item_make_header(const uint8_t nkey, const int flags, const int nb
     return sizeof(item) + nkey + *nsuffix + nbytes;
 }
 
+item *mmcmod_item_alloc(void *mmcstorage, char *key, const size_t nkey,
+                        const int flags, const rel_time_t exptime,
+                        const int nbytes) {
+    item *it;
+    uint8_t nsuffix;
+    char suffix[40];
+
+    size_t ntotal = item_make_header(nkey + 1, flags, nbytes, 
+                                     suffix, &nsuffix);
+
+    it = (item *)mmcstorage_alloc(mmcstorage, key, nkey, ntotal);
+    if (!it)
+        return NULL;    
+
+    it->refcount = 1;
+    DEBUG_REFCNT(it, '*');
+    it->it_flags = 0;
+    it->nkey = nkey;
+    it->nbytes = nbytes;
+    strcpy(ITEM_key(it), key);
+    it->exptime = exptime;
+    memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
+    it->nsuffix = nsuffix;
+    return it;
+
+    return NULL;
+}
+
 /*@null@*/
 item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_time_t exptime, const int nbytes) {
     uint8_t nsuffix;
@@ -533,6 +561,50 @@ item *do_item_get_nocheck(const char *key, const size_t nkey) {
         it->refcount++;
         DEBUG_REFCNT(it, '+');
     }
+    return it;
+}
+ 
+
+item *mmcmod_item_get(void *mmcstorage, const char *key, const int nkey) {
+    int vsiz;
+    item *it = mmcstorage_get(mmcstorage, key, nkey, &vsiz);
+    int was_found = 0;
+
+    if (settings.verbose > 2) {
+        if (it == NULL) {
+            fprintf(stderr, "> NOT FOUND %s", key);
+        } else {
+            fprintf(stderr, "> FOUND KEY %s", ITEM_key(it));
+            was_found++;
+        }
+    }
+
+    if (it != NULL && settings.oldest_live != 0 && settings.oldest_live <= current_time &&
+        it->time <= settings.oldest_live) {
+        mmcstorage_del(mmcstorage, key, nkey);
+        mmcstorage_free(mmcstorage, it, vsiz);
+        it = NULL;
+    }
+
+    if (it == NULL && was_found) {
+        fprintf(stderr, " -nuked by flush");
+        was_found--;
+    }
+
+    if (it != NULL && it->exptime != 0 && it->exptime <= current_time) {
+        mmcstorage_del(mmcstorage, key, nkey);
+        mmcstorage_free(mmcstorage, it, vsiz);
+        it = NULL;
+    }
+
+    if (it == NULL && was_found) {
+        fprintf(stderr, " -nuked by expire");
+        was_found--;
+    }
+
+    if (settings.verbose > 2)
+        fprintf(stderr, "\n");
+
     return it;
 }
 

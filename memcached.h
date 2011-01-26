@@ -279,6 +279,8 @@ struct settings {
     int backlog;
     int item_size_max;        /* Maximum item size, and upper end for slabs */
     bool sasl;              /* SASL on/off */
+    char *enginesopath;
+    char *dbfile;
 };
 
 extern struct stats stats;
@@ -448,6 +450,7 @@ extern int daemonize(int nochdir, int noclose);
 #include "trace.h"
 #include "hash.h"
 #include "util.h"
+#include "mmcstorage.h"
 
 /*
  * Functions such as the libevent-related calls that need to do cross-thread
