@@ -77,28 +77,17 @@
 #define TAIL_REPAIR_TIME (3 * 3600)
 
 /* warning: don't use these macros with a function, as it evals its arg twice */
-#define ITEM_get_cas(i) (((i)->it_flags & ITEM_CAS) ? \
-        (i)->data->cas : (uint64_t)0)
+#define ITEM_get_cas(i) (storage->item_get_cas(i))
 
-#define ITEM_set_cas(i,v) { \
-    if ((i)->it_flags & ITEM_CAS) { \
-        (i)->data->cas = v; \
-    } \
-}
+#define ITEM_set_cas(i,v) (storage->item_set_cas(i,v))
 
-#define ITEM_key(item) (((char*)&((item)->data)) \
-         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+#define ITEM_key(item) (storage->item_key(item))
 
-#define ITEM_suffix(item) ((char*) &((item)->data) + (item)->nkey + 1 \
-         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+#define ITEM_suffix(item) (storage->item_suffix(item))
 
-#define ITEM_data(item) ((char*) &((item)->data) + (item)->nkey + 1 \
-         + (item)->nsuffix \
-         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+#define ITEM_data(item) (storage->item_data(item))
 
-#define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
-         + (item)->nsuffix + (item)->nbytes \
-         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+#define ITEM_ntotal(item) (storage->item_ntotal(item))
 
 #define STAT_KEY_LEN 128
 #define STAT_VAL_LEN 128
@@ -426,6 +415,46 @@ struct conn {
     LIBEVENT_THREAD *thread; /* Pointer to the thread object serving this connection */
 };
 
+struct storage {
+/** Init the subsystem. 1st argument is the limit on no. of bytes to allocate,
+    0 if no limit. 2nd argument is the growth factor; each slab will use a chunk
+    size equal to the previous slab's chunk size times this factor.
+    3rd argument specifies if the slab allocator should allocate all memory
+    up front (if true), or allocate memory in chunks as it is needed (if false)
+*/
+    void (*init)(const size_t, const double, const bool);
+
+/**
+ * Given object size, return id to use when allocating/freeing memory for object
+ * 0 means error: can't store such a large object
+ */
+    unsigned int (*clsid)(const size_t);
+
+/** Allocate object of given length. 0 on error */ /*@null@*/
+    item *(*alloc)(const char *, const size_t, const int, const uint8_t, const unsigned int);
+
+/** Free previously allocated object */
+    void (*free)(item *, size_t, unsigned int);
+
+/** Adjust the stats for memory requested */
+    void (*adjust_mem_requested)(unsigned int, size_t, size_t);
+
+/** Return a datum for stats in binary protocol */
+    bool (*get_stats)(const char *, int, ADD_STAT, void *);
+
+/** Fill buffer with stats */ /*@null@*/
+    void (*stats)(ADD_STAT, void *);
+
+    uint64_t (*item_get_cas)(item *);
+    void (*item_set_cas)(item *, uint64_t);
+    char *(*item_key)(item *);
+    char *(*item_suffix)(item *);
+    char *(*item_data)(item *);
+    int (*item_ntotal)(item *);
+};
+extern struct storage slab_storage;
+extern struct storage pagecache_storage;
+extern struct storage *storage;
 
 /* current time of day (updated periodically) */
 extern volatile rel_time_t current_time;
@@ -442,7 +471,6 @@ extern int daemonize(int nochdir, int noclose);
 
 
 #include "stats.h"
-#include "slabs.h"
 #include "assoc.h"
 #include "items.h"
 #include "trace.h"

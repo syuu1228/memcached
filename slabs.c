@@ -8,6 +8,7 @@
  * memcached protocol.
  */
 #include "memcached.h"
+#include "slabs.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/signal.h>
@@ -418,16 +419,18 @@ static void *memory_allocate(size_t size) {
     return ret;
 }
 
-void *slabs_alloc(size_t size, unsigned int id) {
+item *slabs_alloc(const char *key, const size_t nkey, const int nbytes, const uint8_t nsuffix, const unsigned int id) {
     void *ret;
-
+    const size_t ntotal = sizeof(item) + nkey + nsuffix + nbytes +
+        (settings.use_cas) ? sizeof(uint64_t) : 0;
+    
     pthread_mutex_lock(&slabs_lock);
-    ret = do_slabs_alloc(size, id);
+    ret = do_slabs_alloc(ntotal, id);
     pthread_mutex_unlock(&slabs_lock);
     return ret;
 }
 
-void slabs_free(void *ptr, size_t size, unsigned int id) {
+void slabs_free(item *ptr, size_t size, unsigned int id) {
     pthread_mutex_lock(&slabs_lock);
     do_slabs_free(ptr, size, id);
     pthread_mutex_unlock(&slabs_lock);
@@ -452,3 +455,50 @@ void slabs_adjust_mem_requested(unsigned int id, size_t old, size_t ntotal)
     p->requested = p->requested - old + ntotal;
     pthread_mutex_unlock(&slabs_lock);
 }
+
+static uint64_t slabs_item_get_cas(item *i) {
+    return (i->it_flags & ITEM_CAS) ? i->data->cas : (uint64_t)0;
+}
+
+static void slabs_item_set_cas(item *i, uint64_t v) {
+    if (i->it_flags & ITEM_CAS)
+        i->data->cas = v;
+}
+
+static char *slabs_item_key(item *item) {
+    return (((char*)&(item->data)) 
+            + ((item->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0));
+}
+
+static char *slabs_item_suffix(item *item) {
+    return ((char*) &(item->data) + item->nkey + 1
+            + ((item->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0));
+}
+
+static char *slabs_item_data(item *item) {
+    return ((char*) &(item->data) + item->nkey + 1
+            + item->nsuffix
+            + ((item->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0));
+}
+
+static int slabs_item_ntotal(item *item) {
+    return (sizeof(struct _stritem) + item->nkey + 1
+            + item->nsuffix + item->nbytes
+            + ((item->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0));
+}
+
+struct storage slab_storage = {
+    .init = slabs_init,
+    .clsid = slabs_clsid,
+    .alloc = slabs_alloc,
+    .free = slabs_free,
+    .adjust_mem_requested = slabs_adjust_mem_requested,
+    .get_stats = get_stats,
+    .stats = slabs_stats,
+    .item_get_cas = slabs_item_get_cas,
+    .item_set_cas = slabs_item_set_cas,
+    .item_key = slabs_item_key,
+    .item_suffix = slabs_item_suffix,
+    .item_data = slabs_item_data,
+    .item_ntotal = slabs_item_ntotal
+};

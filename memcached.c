@@ -107,6 +107,9 @@ struct stats stats;
 struct settings settings;
 time_t process_started;     /* when the process was started */
 
+/** storage backend variables **/
+struct storage *storage = &slab_storage;
+
 /** file scope variables **/
 static conn *listen_conn = NULL;
 static struct event_base *main_base;
@@ -1362,7 +1365,7 @@ static void process_bin_stat(conn *c) {
     if (nkey == 0) {
         /* request all statistics */
         server_stats(&append_stats, c);
-        (void)get_stats(NULL, 0, &append_stats, c);
+        (void)storage->get_stats(NULL, 0, &append_stats, c);
     } else if (strncmp(subcommand, "reset", 5) == 0) {
         stats_reset();
     } else if (strncmp(subcommand, "settings", 8) == 0) {
@@ -1388,7 +1391,7 @@ static void process_bin_stat(conn *c) {
             return;
         }
     } else {
-        if (get_stats(subcommand, nkey, &append_stats, c)) {
+        if (storage->get_stats(subcommand, nkey, &append_stats, c)) {
             if (c->stats.buffer == NULL) {
                 write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
             } else {
@@ -2460,7 +2463,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
 
     if (ntokens == 2) {
         server_stats(&append_stats, c);
-        (void)get_stats(NULL, 0, &append_stats, c);
+        (void)storage->get_stats(NULL, 0, &append_stats, c);
     } else if (strcmp(subcommand, "reset") == 0) {
         stats_reset();
         out_string(c, "RESET");
@@ -2501,7 +2504,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     } else {
         /* getting here means that the subcommand is either engine specific or
            is invalid. query the engine and see. */
-        if (get_stats(subcommand, strlen(subcommand), &append_stats, c)) {
+        if (storage->get_stats(subcommand, strlen(subcommand), &append_stats, c)) {
             if (c->stats.buffer == NULL) {
                 out_string(c, "SERVER_ERROR out of memory writing stats");
             } else {
@@ -4377,6 +4380,7 @@ int main (int argc, char **argv) {
           "B:"  /* Binding protocol */
           "I:"  /* Max item size */
           "S"   /* Sasl ON */
+          "e:"  /* Backend storage */
         ))) {
         switch (c) {
         case 'a':
@@ -4539,6 +4543,17 @@ int main (int argc, char **argv) {
 #endif
             settings.sasl = true;
             break;
+        case 'e':
+            if (strcmp(optarg, "slab") == 0) {
+                // do nothing
+            } else if (strcmp(optarg, "pagecache") == 0) {
+                storage = &pagecache_storage;
+            } else {
+                fprintf(stderr, "Invalid value for backend module: %s\n"
+                        " -- should be one of slab, pagecache\n", optarg);
+                exit(EX_USAGE);
+            }
+            break;
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
             return 1;
@@ -4661,7 +4676,7 @@ int main (int argc, char **argv) {
     stats_init();
     assoc_init();
     conn_init();
-    slabs_init(settings.maxbytes, settings.factor, preallocate);
+    storage->init(settings.maxbytes, settings.factor, preallocate);
 
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we

@@ -92,7 +92,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
         ntotal += sizeof(uint64_t);
     }
 
-    unsigned int id = slabs_clsid(ntotal);
+    unsigned int id = storage->clsid(ntotal);
     if (id == 0)
         return 0;
 
@@ -114,7 +114,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
             STATS_UNLOCK();
             itemstats[id].reclaimed++;
             it->refcount = 1;
-            slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
+            storage->adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
             do_item_unlink(it);
             /* Initialize the item block: */
             it->slabs_clsid = 0;
@@ -123,7 +123,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
         }
     }
 
-    if (it == NULL && (it = slabs_alloc(ntotal, id)) == NULL) {
+    if (it == NULL && (it = storage->alloc(key, nkey, nbytes, nsuffix, id)) == NULL) {
         /*
         ** Could not find an expired item at the tail, and memory allocation
         ** failed. Try to evict some items!
@@ -171,7 +171,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
                 break;
             }
         }
-        it = slabs_alloc(ntotal, id);
+        it = storage->alloc(key, nkey, nbytes, nsuffix, id);
         if (it == 0) {
             itemstats[id].outofmemory++;
             /* Last ditch effort. There is a very rare bug which causes
@@ -190,7 +190,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
                     break;
                 }
             }
-            it = slabs_alloc(ntotal, id);
+            it = storage->alloc(key, nkey, nbytes, nsuffix, id);
             if (it == 0) {
                 return NULL;
             }
@@ -229,7 +229,7 @@ void item_free(item *it) {
     it->slabs_clsid = 0;
     it->it_flags |= ITEM_SLABBED;
     DEBUG_REFCNT(it, 'F');
-    slabs_free(it, ntotal, clsid);
+    storage->free(it, ntotal, clsid);
 }
 
 /**
@@ -240,8 +240,8 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     char prefix[40];
     uint8_t nsuffix;
 
-    return slabs_clsid(item_make_header(nkey + 1, flags, nbytes,
-                                        prefix, &nsuffix)) != 0;
+    return storage->clsid(item_make_header(nkey + 1, flags, nbytes,
+                                           prefix, &nsuffix)) != 0;
 }
 
 static void item_link_q(item *it) { /* item is the new head */
