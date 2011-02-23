@@ -164,6 +164,7 @@ static void process_command(conn *c, char *command);
 static void write_and_free(conn *c, char *buf, int bytes);
 static int ensure_iov_space(conn *c);
 static int add_iov(conn *c, const void *buf, int len);
+static int add_iov_sendfile(conn *c, int fd, int len);
 static int add_msghdr(conn *c);
 
 
@@ -302,7 +303,7 @@ static int add_msghdr(conn *c)
     assert(c != NULL);
 
     if (c->msgsize == c->msgused) {
-        msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
+        msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct _msghdr));
         if (! msg)
             return -1;
         c->msglist = msg;
@@ -313,7 +314,7 @@ static int add_msghdr(conn *c)
 
     /* this wipes msg_iovlen, msg_control, msg_controllen, and
        msg_flags, the last 3 of which aren't defined on solaris: */
-    memset(msg, 0, sizeof(struct msghdr));
+    memset(msg, 0, sizeof(struct _msghdr));
 
     msg->msg_iov = &c->iov[c->iovused];
 
@@ -445,7 +446,7 @@ static bool conn_reset_buffersize(conn *c) {
     }
 
     if (c->msgsize != MSG_LIST_INITIAL) {
-        void *ptr = malloc(sizeof(struct msghdr) * MSG_LIST_INITIAL);
+        void *ptr = malloc(sizeof(struct _msghdr) * MSG_LIST_INITIAL);
         if (ptr != NULL) {
             free(c->msglist);
             c->msglist = ptr;
@@ -897,7 +898,7 @@ static int add_iov(conn *c, const void *buf, int len) {
     bool limit_to_mtu;
 
     assert(c != NULL);
-
+    printf("add_iov(%s,%d)", (char *)buf, len);
     do {
         m = &c->msglist[c->msgused - 1];
 
@@ -928,6 +929,7 @@ static int add_iov(conn *c, const void *buf, int len) {
         m = &c->msglist[c->msgused - 1];
         m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
         m->msg_iov[m->msg_iovlen].iov_len = len;
+        printf(" m:%d iov:%zd", c->msgused - 1, m->msg_iovlen);
 
         c->msgbytes += len;
         c->iovused++;
@@ -936,10 +938,26 @@ static int add_iov(conn *c, const void *buf, int len) {
         buf = ((char *)buf) + len;
         len = leftover;
     } while (leftover > 0);
+    printf("\n");
 
     return 0;
 }
 
+static int add_iov_sendfile(conn *c, int fd, int len) {
+    struct msghdr *m;
+    struct _msghdr *_m;
+    assert(c != NULL);
+
+    m = &c->msglist[c->msgused - 1];
+    printf("add_iov_sendfile(%d, %d) m:%d iov:%zd\n",
+           fd, len, c->msgused - 1, m->msg_iovlen);
+    _m = (struct _msghdr *)m;
+    _m->fd = fd;
+    _m->len = len;
+    _m->iov_pos = m->msg_iovlen;
+
+    return 0;
+}
 
 /*
  * Constructs a set of UDP headers and attaches them to the outgoing messages.
@@ -3925,14 +3943,25 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 }
                 else
                 {
-                  if (add_iov(c, "VALUE ", 6) != 0 ||
-                      add_iov(c, info.key, info.nkey) != 0 ||
-                      add_iov(c, suffix, suffix_len) != 0 ||
-                      add_iov(c, info.value[0].iov_base, info.value[0].iov_len) != 0)
-                      {
-                          settings.engine.v1->release(settings.engine.v0, c, it);
-                          break;
-                      }
+                    if (info.fd) {
+                        if (add_iov(c, "VALUE ", 6) != 0 ||
+                            add_iov(c, info.key, info.nkey) != 0 ||
+                            add_iov(c, suffix, suffix_len) != 0 ||
+                            add_iov_sendfile(c, info.fd, info.value[0].iov_len) != 0)
+                        {
+                            settings.engine.v1->release(settings.engine.v0, c, it);
+                            break;
+                        }
+                    }else{
+                        if (add_iov(c, "VALUE ", 6) != 0 ||
+                            add_iov(c, info.key, info.nkey) != 0 ||
+                            add_iov(c, suffix, suffix_len) != 0 ||
+                            add_iov(c, info.value[0].iov_base, info.value[0].iov_len) != 0)
+                        {
+                            settings.engine.v1->release(settings.engine.v0, c, it);
+                            break;
+                        }
+                    }
                 }
 
 
@@ -4683,11 +4712,37 @@ static enum transmit_result transmit(conn *c) {
     if (c->msgcurr < c->msgused) {
         ssize_t res;
         struct msghdr *m = &c->msglist[c->msgcurr];
+        struct _msghdr *_m = (struct _msghdr *)&c->msglist[c->msgcurr];
+        int orig_pos = 0;
 
+        assert (m == &_m->m);
+        assert (m->msg_iov == _m->m.msg_iov);
+        assert (m->msg_iovlen == _m->m.msg_iovlen);
+        
+        if (_m->fd && m->msg_iovlen > _m->iov_pos) {
+            orig_pos = m->msg_iovlen;
+            m->msg_iovlen = _m->iov_pos;
+        }
         res = sendmsg(c->sfd, m, 0);
+        printf("orig_pos:%d msg_iov:%p msg_iovlen:%zd res:%zd\n",
+               orig_pos, (void *)m->msg_iov, m->msg_iovlen, res);
+        if (orig_pos)
+            m->msg_iovlen = orig_pos;
+        
         if (res > 0) {
             STATS_ADD(c, bytes_written, res);
 
+            if (_m->fd) {
+                do {
+                    ssize_t res = sendfile(c->sfd, _m->fd, NULL, _m->len);
+                    printf("sendfile:%zd len:%d\n", res, _m->len);
+                    if (res > 0)
+                        _m->len -= res;
+                } while(_m->len > 0);
+                
+                _m->fd = 0;
+            }
+            
             /* We've written some of the data. Remove the completed
                iovec entries from the list of pending writes. */
             while (m->msg_iovlen > 0 && res >= m->msg_iov->iov_len) {
@@ -4695,6 +4750,7 @@ static enum transmit_result transmit(conn *c) {
                 m->msg_iovlen--;
                 m->msg_iov++;
             }
+            printf("msg_iovlen:%zd msg_iov:%p\n", m->msg_iovlen, (void *)m->msg_iov);
 
             /* Might have written just part of the last iovec entry;
                adjust it so the next write will do the rest. */

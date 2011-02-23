@@ -385,6 +385,13 @@ struct conn {
     } pending_close;
 };
 
+struct _msghdr {
+    struct msghdr m;
+    int fd;
+    int len;
+    int iov_pos;
+};
+
 /* States for the connection list_state */
 #define LIST_STATE_PROCESSING 1
 #define LIST_STATE_REQ_PENDING_IO 2
