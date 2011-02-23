@@ -34,6 +34,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include "recvfile.h"
 
 static inline void item_set_cas(const void *cookie, item *it, uint64_t cas) {
     settings.engine.v1->item_set_cas(settings.engine.v0, cookie, it, cas);
@@ -4064,7 +4065,12 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         c->ritem = info.value[0].iov_base;
         c->rlbytes = vlen;
         c->store_op = store_op;
-        conn_set_state(c, conn_nread);
+        if (info.fd) {
+            c->ritem_fd = info.fd;
+            conn_set_state(c, conn_nread_recvfile);
+        }else{
+            conn_set_state(c, conn_nread);
+        }
         break;
     case ENGINE_EWOULDBLOCK:
         c->ewouldblock = true;
@@ -4996,9 +5002,85 @@ bool conn_nread(conn *c) {
             return true;
         }
     }
-
     /*  now try reading from the socket */
     res = read(c->sfd, c->ritem, c->rlbytes);
+    if (res > 0) {
+        STATS_ADD(c, bytes_read, res);
+        if (c->rcurr == c->ritem) {
+            c->rcurr += res;
+        }
+        c->ritem += res;
+        c->rlbytes -= res;
+        return true;
+    }
+    if (res == 0) { /* end of stream */
+        conn_set_state(c, conn_closing);
+        return true;
+    }
+    if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (!update_event(c, EV_READ | EV_PERSIST)) {
+            if (settings.verbose > 0) {
+                settings.extensions.logger->log(EXTENSION_LOG_INFO, c,
+                                                "Couldn't update event\n");
+            }
+            conn_set_state(c, conn_closing);
+            return true;
+        }
+        return false;
+    }
+
+    if (errno != ENOTCONN && errno != ECONNRESET) {
+        /* otherwise we have a real error, on which we close the connection */
+        settings.extensions.logger->log(EXTENSION_LOG_WARNING, c,
+                                        "Failed to read, and not due to blocking:\n"
+                                        "errno: %d %s \n"
+                                        "rcurr=%lx ritem=%lx rbuf=%lx rlbytes=%d rsize=%d\n",
+                                        errno, strerror(errno),
+                                        (long)c->rcurr, (long)c->ritem, (long)c->rbuf,
+                                        (int)c->rlbytes, (int)c->rsize);
+    }
+    conn_set_state(c, conn_closing);
+    return true;
+}
+
+bool conn_nread_recvfile(conn *c) {
+    ssize_t res;
+    int tocopy = 0;
+    
+    if (c->rlbytes == 0) {
+        LIBEVENT_THREAD *t = c->thread;
+        LOCK_THREAD(t);
+        bool block = c->ewouldblock = false;
+        complete_nread(c);
+        UNLOCK_THREAD(t);
+        /* Breaking this into two, as complete_nread may have
+           moved us to a different thread */
+        t = c->thread;
+        LOCK_THREAD(t);
+        if (c->ewouldblock) {
+            event_del(&c->event);
+            block = true;
+        }
+        UNLOCK_THREAD(t);
+        return !block;
+    }
+    /* first check if we have leftovers in the conn_read buffer */
+    if (c->rbytes > 0) {
+        tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
+        if (c->ritem != c->rcurr) {
+            memmove(c->ritem, c->rcurr, tocopy);
+        }
+        c->ritem += tocopy;
+        c->rlbytes -= tocopy;
+        c->rcurr += tocopy;
+        c->rbytes -= tocopy;
+        if (c->rlbytes == 0) {
+            return true;
+        }
+    }
+    /*  now try reading from the socket */
+    off_t off = tocopy;
+    res = recvfile(c->ritem_fd, c->sfd, &off, c->rlbytes);
     if (res > 0) {
         STATS_ADD(c, bytes_read, res);
         if (c->rcurr == c->ritem) {

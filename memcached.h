@@ -298,6 +298,7 @@ struct conn {
     void   *write_and_free; /** free this memory after finishing writing */
 
     char   *ritem;  /** when we read in an item's value, it goes here */
+    int    ritem_fd;
     int    rlbytes;
 
     /* data for the nread state */
@@ -469,6 +470,7 @@ bool conn_read(conn *c);
 bool conn_parse_cmd(conn *c);
 bool conn_write(conn *c);
 bool conn_nread(conn *c);
+bool conn_nread_recvfile(conn *c);
 bool conn_swallow(conn *c);
 bool conn_pending_close(conn *c);
 bool conn_immediate_close(conn *c);

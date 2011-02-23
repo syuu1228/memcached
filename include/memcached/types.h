@@ -74,6 +74,7 @@ extern "C" {
                           * OUT: the number of elements used in value */
         const void *key;
         struct iovec value[1];
+		int fd;
     } item_info;
 
     typedef struct {
