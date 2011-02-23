@@ -952,6 +952,7 @@ static int add_iov_sendfile(conn *c, int fd, int len) {
     printf("add_iov_sendfile(%d, %d) m:%d iov:%zd\n",
            fd, len, c->msgused - 1, m->msg_iovlen);
     _m = (struct _msghdr *)m;
+    assert(!_m->fd);
     _m->fd = fd;
     _m->len = len;
     _m->iov_pos = m->msg_iovlen;
@@ -4733,7 +4734,12 @@ static enum transmit_result transmit(conn *c) {
             STATS_ADD(c, bytes_written, res);
 
             if (_m->fd) {
+                struct pollfd pfd;
+                pfd.fd = c->sfd;
+                pfd.events = POLLOUT;
                 do {
+                    if (poll(&pfd, 1, -1) != 1)
+                        continue;
                     ssize_t res = sendfile(c->sfd, _m->fd, NULL, _m->len);
                     printf("sendfile:%zd len:%d\n", res, _m->len);
                     if (res > 0)
