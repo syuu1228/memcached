@@ -898,7 +898,6 @@ static int add_iov(conn *c, const void *buf, int len) {
     bool limit_to_mtu;
 
     assert(c != NULL);
-    printf("add_iov(%s,%d)", (char *)buf, len);
     do {
         m = &c->msglist[c->msgused - 1];
 
@@ -929,7 +928,6 @@ static int add_iov(conn *c, const void *buf, int len) {
         m = &c->msglist[c->msgused - 1];
         m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
         m->msg_iov[m->msg_iovlen].iov_len = len;
-        printf(" m:%d iov:%zd", c->msgused - 1, m->msg_iovlen);
 
         c->msgbytes += len;
         c->iovused++;
@@ -938,7 +936,6 @@ static int add_iov(conn *c, const void *buf, int len) {
         buf = ((char *)buf) + len;
         len = leftover;
     } while (leftover > 0);
-    printf("\n");
 
     return 0;
 }
@@ -949,8 +946,6 @@ static int add_iov_sendfile(conn *c, int fd, int len) {
     assert(c != NULL);
 
     m = &c->msglist[c->msgused - 1];
-    printf("add_iov_sendfile(%d, %d) m:%d iov:%zd\n",
-           fd, len, c->msgused - 1, m->msg_iovlen);
     _m = (struct _msghdr *)m;
     assert(!_m->fd);
     _m->fd = fd;
@@ -4725,8 +4720,6 @@ static enum transmit_result transmit(conn *c) {
             m->msg_iovlen = _m->iov_pos;
         }
         res = sendmsg(c->sfd, m, 0);
-        printf("orig_pos:%d msg_iov:%p msg_iovlen:%zd res:%zd\n",
-               orig_pos, (void *)m->msg_iov, m->msg_iovlen, res);
         if (orig_pos)
             m->msg_iovlen = orig_pos;
         
@@ -4741,7 +4734,6 @@ static enum transmit_result transmit(conn *c) {
                     if (poll(&pfd, 1, -1) != 1)
                         continue;
                     ssize_t res = sendfile(c->sfd, _m->fd, NULL, _m->len);
-                    printf("sendfile:%zd len:%d\n", res, _m->len);
                     if (res > 0)
                         _m->len -= res;
                 } while(_m->len > 0);
@@ -4756,7 +4748,6 @@ static enum transmit_result transmit(conn *c) {
                 m->msg_iovlen--;
                 m->msg_iov++;
             }
-            printf("msg_iovlen:%zd msg_iov:%p\n", m->msg_iovlen, (void *)m->msg_iov);
 
             /* Might have written just part of the last iovec entry;
                adjust it so the next write will do the rest. */
