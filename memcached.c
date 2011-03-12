@@ -797,6 +797,8 @@ const char *state_text(STATE_FUNC state) {
         return "conn_write";
     } else if (state == conn_nread) {
         return "conn_nread";
+    } else if (state == conn_nread_recvfile) {
+        return "conn_nread_recvfile";
     } else if (state == conn_swallow) {
         return "conn_swallow";
     } else if (state == conn_closing) {
@@ -1725,7 +1727,7 @@ static void process_bin_get(conn *c) {
         }
 
         /* Add the data minus the CRLF */
-        add_iov(c, info.value[0].iov_base, info.value[0].iov_len - 2);
+        add_iov_sendfile(c, info.fd, info.value[0].iov_len - 2);
         conn_set_state(c, conn_mwrite);
         /* Remember this command so we can garbage collect it later */
         c->item = it;
@@ -3046,7 +3048,12 @@ static void process_bin_update(conn *c) {
         c->item = it;
         c->ritem = info.value[0].iov_base;
         c->rlbytes = vlen;
-        conn_set_state(c, conn_nread);
+        if (info.fd) {
+            c->ritem_fd = info.fd;
+            conn_set_state(c, conn_nread_recvfile);
+        }else{
+            conn_set_state(c, conn_nread);
+        }
         c->substate = bin_read_set_value;
         break;
     case ENGINE_EWOULDBLOCK:
